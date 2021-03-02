@@ -1,0 +1,115 @@
+---
+title: "Kallisto vs Cellranger"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyverse)
+library(Seurat)
+example_srx <- "SRX8241388"
+cellranger_sampletable <-  read_tsv('cellrangeSampleTable.tsv', col_names = c('sample_accession', 'BioSample','mouse', 'path'))
+acc2mouse <- cellranger_sampletable$mouse
+names(acc2mouse) <- cellranger_sampletable$sample_accession
+cellranger_outdir <-paste0(example_srx, '/outs/filtered_feature_bc_matrix/')
+cellranger_data <- Read10X(cellranger_outdir)
+mouse <- acc2mouse[example_srx]
+colnames(cellranger_data) <- paste(mouse, colnames(cellranger_data), sep = '_')
+sanes_amacrine_labels <- read_csv('sanes_amacrine_subcluster_labels.csv', skip = 2, col_names = c('Barcode', 'sanes_subcluster'))
+msng_cells <- colnames(cellranger_data)[!colnames(cellranger_data) %in% sanes_amacrine_labels$Barcode]
+cellranger_metadata <- bind_rows(sanes_amacrine_labels,
+                                tibble(Barcode = msng_cells, sanes_subcluster = 'NonAmacrine')
+                                ) %>% as.data.frame %>% 
+  mutate(is_amacrine = ifelse(sanes_subcluster == 'NonAmacrine', 'NonAmacrine', 'Amacrine'))
+rownames(cellranger_metadata) <- cellranger_metadata$Barcode
+
+run_seurat_pipeline <- function(mat, md){
+  seu <- CreateSeuratObject(mat, meta.data = md)
+  seu <- seu[,seu$nFeature_RNA > 200]
+  seu <- NormalizeData(seu)
+  seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = 5000)
+  seu <- ScaleData(seu)
+  seu <- RunPCA(seu, npcs = 50,features = VariableFeatures(object = seu))
+  keep_pcs = 1:20
+  seu <- RunUMAP(seu, dims = keep_pcs)
+  return(seu)
+}
+
+
+cellranger_seu <- run_seurat_pipeline(cellranger_data, cellranger_metadata)
+
+```
+
+
+```{r}
+library(BUSpaRse)
+kallisto_data <- read_count_output(paste0('bus_out/gencode/',  example_srx), 'output.corrected')
+tot_counts <- Matrix::colSums(kallisto_data)
+bc_rank <-DropletUtils::barcodeRanks(kallisto_data)
+kallisto_data <- kallisto_data[, tot_counts > bc_rank@metadata$inflection]
+
+## convert gene ids to gene names 
+mouse_gtf <- rtracklayer::readGFF('references/gtf/mm-mus_musculus_anno.gtf.gz')
+gene_id2gene_name <- mouse_gtf %>% filter(type == 'gene') %>% select(gene_id, gene_name) %>% distinct
+rownames(gene_id2gene_name) <- gene_id2gene_name$gene_id
+rownames(kallisto_data) <- gene_id2gene_name[rownames(kallisto_data), 'gene_name']
+colnames(kallisto_data) <-  make.unique(paste0(mouse, '_', colnames(kallisto_data), '-1'))
+ksto_msg_cells <- colnames(kallisto_data)[!colnames(kallisto_data) %in% sanes_amacrine_labels$Barcode]
+kallisto_metadata <- bind_rows(sanes_amacrine_labels,
+                                tibble(Barcode = ksto_msg_cells, sanes_subcluster = 'NonAmacrine')
+                                ) %>% as.data.frame %>% 
+  mutate(is_amacrine = ifelse(sanes_subcluster == 'NonAmacrine', 'NonAmacrine', 'Amacrine'))
+rownames(kallisto_metadata) <- kallisto_metadata$Barcode
+kallisto_seu <- run_seurat_pipeline(kallisto_data,kallisto_metadata)
+```
+
+
+```{r}
+library(patchwork)
+dp <- DimPlot(cellranger_seu, group.by = 'is_amacrine')
+fp <- FeaturePlot(cellranger_seu, features = 'Arr3')
+
+cellranger_plot <- dp/fp + plot_annotation(title = 'Cellranger based quantification')
+ggsave('cellranger_plot.png',  plot = cellranger_plot, height = 12, width = 9)
+sum(GetAssayData(cellranger_seu, 'counts')['Arr3', ] > 0)
+```
+
+```{r}
+dp <- DimPlot(kallisto_seu, group.by = 'is_amacrine')
+fp <- FeaturePlot(kallisto_seu, features = 'Arr3')
+kallisto_plot <- dp/fp + plot_annotation(title =  'Kallisto-bustools based quantification')
+ggsave('kallisto_plot.png',  plot = kallisto_plot, height = 12, width = 9)
+sum(GetAssayData(kallisto_seu, 'counts')['Arr3', ] > 0)
+```
+
+
+```{r}
+square_off_matrices_calc_cor <-function(mat1, mat2){
+  set.seed(2000)
+  common_cells <- intersect(colnames(mat1), colnames(mat2)) 
+  print(length(common_cells))
+  
+  
+  common_genes <- intersect(rownames(mat1), rownames(mat2)) 
+  mat1 <- mat1[common_genes,common_cells ]
+  mat2 <- mat2[common_genes,common_cells] 
+  ## remove rows with 0
+  mat1_exp_genes <- rownames(mat1)[ rowSums(mat1) > 0]
+  mat2_exp_genes <- rownames(mat2)[ rowSums(mat2) > 0]
+  keep_genes <- union(mat1_exp_genes, mat2_exp_genes)
+  mat1 <- mat1[keep_genes, ] %>% as.data.frame
+  mat2 <- mat2[keep_genes, ] %>% as.data.frame
+  
+  stopifnot(all(rownames(mat1) == rownames(mat2)))
+  stopifnot(all(colnames(mat1) == colnames(mat2)))
+  print(dim(mat1))
+  sample_cor <- mclapply(common_cells, 
+                            function(i) cor(mat1[[i]],mat2[[i]], method = 'pearson'),
+                            mc.cores = 8) %>% unlist
+  return(sample_cor)
+}
+
+kallisto_vs_cellranger_cor <- square_off_matrices_calc_cor(cellranger_data, kallisto_data)
+summary(kallisto_vs_cellranger_cor)
+```
+
